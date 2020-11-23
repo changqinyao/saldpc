@@ -17,7 +17,7 @@ from torch.utils import data
 from torch.autograd import Variable
 from data_loader import DHF1K_frames, Hollywood_frames,SALICONDataset
 
-from model import salSEPC,salSEPCema
+from model import salSEPC,salSEPCema,SalEMA
 import metric
 from utils import nss,kld_loss,corr_coeff
 
@@ -31,7 +31,7 @@ momentum = 0.9
 weight_decay = 1e-4
 # epochs = 7+1 #+3+2
 plot_every = 1
-clip_length = 8
+clip_length = 20
 
 # temporal = True
 # RESIDUAL = False
@@ -42,7 +42,7 @@ LEARN_ALPHA_ONLY = False
 # EMA_LOC_2 = 54
 # PROCESS = 'parallel'
 # Parameters
-params_train = {'batch_size': 1,
+params_train = {'batch_size': 6,
            'shuffle':True,
           # number of videos / batch, I need to implement padding if I want to do more than 1, but with DataParallel it's quite messy
           'num_workers': 4,
@@ -72,11 +72,14 @@ class Meter:
         self.kl = []
         self.cc = []
         self.auc = []
+        self.sim=[]
         self.loss=[]
 
     def update(self,outputs,sal,fix,loss):
         nss = metric.NSS(outputs, fix)
         cc=metric.CC(outputs,sal)
+        # sim=metric.SIM(outputs,sal)
+        # self.sim.append(sim)
         self.nss.append(nss)
         self.loss.append(loss)
         self.cc.append(cc)
@@ -85,6 +88,7 @@ class Meter:
     def get_metrics(self):
         nss=np.nanmean(self.nss)
         cc=np.nanmean(self.cc)
+        # sim=np.nanmean(self.sim)
         loss=np.nanmean(self.loss)
         return cc,nss,loss
 
@@ -98,12 +102,29 @@ def loss_sequences(pred_seq, sal_seq, fix_seq, metrics=['kld','nss','cc']):
     losses = []
     for this_metric in metrics:
         if this_metric == 'kld':
-            losses.append(kld_loss(pred_seq, sal_seq))
+            losses.append(kld_loss(pred_seq, sal_seq).mean())
+            # losses.append(0.5)
         if this_metric == 'nss':
-            losses.append(nss(pred_seq, fix_seq))
+            losses.append(nss(pred_seq, fix_seq).mean())
         if this_metric == 'cc':
-            losses.append(corr_coeff(pred_seq, sal_seq))
+            losses.append(corr_coeff(pred_seq, sal_seq).mean())
     return losses
+
+
+def load_model(pt_model, new_model):
+
+    temp = torch.load(pt_model)['state_dict']
+    # Because of dataparallel there is contradiction in the name of the keys so we need to remove part of the string in the keys:.
+    from collections import OrderedDict
+    checkpoint = OrderedDict()
+    for key in temp.keys():
+        new_key = key.replace("module.","")
+        checkpoint[new_key]=temp[key]
+
+    new_model.load_state_dict(checkpoint, strict=True)
+
+    return new_model
+
 
 
 def main(args):
@@ -114,6 +135,7 @@ def main(args):
     if args.dataset == "DHF1K":
         print("Commencing training on dataset {}".format(args.dataset))
         train_set = DHF1K_frames(
+            phase='train',
             root_path=args.src,
             load_gt=True,
             number_of_videos=int(args.end),
@@ -127,6 +149,7 @@ def main(args):
 
         if args.val_perc > 0:
             val_set = DHF1K_frames(
+                phase='val',
                 root_path=args.src,
                 load_gt=True,
                 number_of_videos=int(args.end),
@@ -177,11 +200,12 @@ def main(args):
         temporal = False
     elif 'EMA' in args.new_model:
         if args.double_ema != False:
-            model = salSEPCema(alpha=0.3)
+            model = salSEPCema()
             print("Initialized {}".format(args.new_model))
         else:
             if args.dataset=='DHF1K':
                 model = salSEPCema(alpha=None,backbone_name='res2net')
+                # model = SalEMA(alpha=args.alpha,residual=args.residual, dropout= args.dropout, ema_loc=args.ema_loc)
             if args.dataset=='salicon':
                 model = salSEPC(backbone_name='res2net')
             print("Initialized {} with residual set to {} and dropout set to {}".format(args.new_model, args.residual,
@@ -211,6 +235,7 @@ def main(args):
 
     else:
         # optimizer = torch.optim.Adam(model.parameters(), args.lr, betas=(0.9, 0.999), eps=1e-08, weight_decay=weight_decay)
+
         pg0,pg1,pg2=[],[],[]
         if args.alpha is None:
             for k, v in model.named_parameters():
@@ -230,9 +255,11 @@ def main(args):
             if hasattr(model, 'alpha'):
                 optimizer.add_param_group({'params': model.alpha, 'lr': 0.1})
             del pg0, pg1, pg2
+
             # optimizer = torch.optim.Adam([
-            #     {'params': model.parameters(), 'lr': args.lr, 'weight_decay': weight_decay},
+            #     {'params': model.salgan.parameters(), 'lr': args.lr, 'weight_decay': weight_decay},
             #     {'params': model.alpha, 'lr': 0.1}])
+
         else:
             optimizer = torch.optim.Adam([
                 {'params': model.salgan.parameters(), 'lr': args.lr, 'weight_decay': weight_decay}])
@@ -278,17 +305,25 @@ def main(args):
         bceloss=bceloss.cuda()
     # =================================================
     # ================== Training =====================
+    max_val_nss = float('-inf')
+
 
     # 加载静态
-    checkpoint = torch.load('salsepcbce.pt')
+    checkpoint = torch.load('salsepckl.pt')     #/home/ubuntu/Downloads/SalEMA30.pt
     model.load_state_dict(checkpoint['state_dict'],strict=False)
     # optimizer.load_state_dict(checkpoint['optimizer'])
+    # max_val_nss = checkpoint['val_nss']
+
+    # load_model('/home/ubuntu/Downloads/SalEMA30.pt', model)
+    if args.dataset == "salicon":
+        optimizer.load_state_dict(checkpoint['optimizer'])
+        max_val_nss=checkpoint['val_nss']
 
     train_losses = []
     val_nsses = []
     starting_time = datetime.datetime.now().replace(microsecond=0)
     print("Training started at : {}".format(starting_time))
-    max_val_nss=float('-inf')
+
 
     n_iter = 0
     # if "EMA" in args.new_model:
@@ -308,13 +343,13 @@ def main(args):
             if args.val_perc > 0:
                 print("Running validation..")
                 with torch.no_grad():
-                    nss,loss,n_iter, optimizer = val_img(val_loader, model, bceloss, optimizer, epoch, n_iter,
+                    cc,nss,loss,n_iter, optimizer = val_img(val_loader, model, bceloss, optimizer, epoch, n_iter,
                                                       args.use_gpu, args.double_ema, args.thaw, temporal, dtype)
-                print("Epoch{}\tValidation loss: {}\t nss : {}".format(epoch,loss,nss))
+                print("Epoch{}\tValidation loss: {}\t nss : {}\t:{}".format(epoch,loss,nss,cc))
                 scheduler.step(nss)
 
             if epoch % plot_every == 0:
-                train_losses.append(train_loss.cpu())
+                train_losses.append(train_loss)
                 if args.val_perc > 0:
                     val_nsses.append(nss)
             if nss>max_val_nss:
@@ -324,7 +359,7 @@ def main(args):
                     'state_dict': model.cpu().state_dict(),
                     'optimizer': optimizer.state_dict(),
                     'val_nss':max_val_nss
-                }, 'salsepcbce' + ".pt")
+                }, 'salsepckl' + ".pt")
 
             if args.use_gpu == 'parallel':
                 model = nn.DataParallel(model).cuda()
@@ -361,13 +396,13 @@ def main(args):
             #     train_losses.append(train_loss.cpu())
             #     if args.val_perc > 0:
             #         val_nsses.append(nss)
-            if nss>min_val_nss:
-                min_val_nss=nss
+            if nss>max_val_nss:
+                max_val_nss=nss
                 torch.save({
                     'epoch': epoch + 1,
                     'state_dict': model.cpu().state_dict(),
                     'optimizer': optimizer.state_dict(),
-                    'val_nss':min_val_nss
+                    'val_nss':max_val_nss
                 }, args.new_model + ".pt")
 
             if args.use_gpu == 'parallel':
@@ -486,142 +521,152 @@ def train(train_loader, model, criterion, optimizer, epoch, n_iter, use_gpu, dou
             #some weird bug happens there
             continue
         """
+        clip, gtruths, gtruths_fix=video[0][0].cuda(),video[0][1].cuda(),video[0][2].cuda()
         # print(type(video))
         accumulated_losses = []
         start = datetime.datetime.now().replace(microsecond=0)
-        print("Number of clips for video {} : {}".format(i, len(video)))
+        # print("Number of clips for video {} : {}".format(i, len(video)))
         state = None  # Initially no hidden state
-        for j, (clip, gtruths,gtruths_fix) in enumerate(video):
 
-            n_iter += j
 
-            # Reset Gradients
-            optimizer.zero_grad()
+        # for j, (clip, gtruths,gtruths_fix) in enumerate(video):
 
-            # Squeeze out the video dimension
-            # [video_batch, clip_length, channels, height, width]
-            # After transpose:
-            # [clip_length, video_batch, channels, height, width]
+        # n_iter += j
 
-            clip = Variable(clip.type(dtype).transpose(0, 1))
-            gtruths = Variable(gtruths.type(dtype).transpose(0, 1))
-            gtruths_fix=Variable(gtruths_fix.type(dtype).transpose(0, 1))
+        # Reset Gradients
+        optimizer.zero_grad()
 
-            if temporal and not double:
-                # print(clip.size()) #works! torch.Size([5, 1, 1, 360, 640])
-                loss3 = 0
-                b_size=clip.size()[0]
-                for idx in range(b_size):
-                    # print(clip[idx].size())
+        # Squeeze out the video dimension
+        # [video_batch, clip_length, channels, height, width]
+        # After transpose:
+        # [clip_length, video_batch, channels, height, width]
 
-                    # Compute output
-                    state, saliency_map = model.forward(x=clip[idx],
+        clip = Variable(clip.type(dtype).transpose(0, 1))
+        gtruths = Variable(gtruths.type(dtype).transpose(0, 1))
+        gtruths_fix=Variable(gtruths_fix.transpose(0, 1))
+
+        if temporal and not double:
+            # print(clip.size()) #works! torch.Size([5, 1, 1, 360, 640])
+            loss3 = 0
+            b_size=clip.size()[0]
+            for idx in range(b_size):
+                # print(clip[idx].size())
+
+                # Compute output
+                if state is None:
+                    state, saliency_map = model.forward(x=clip[idx].detach(),
                                                         prev_state=state)  # Based on the number of epoch the model will unfreeze deeper layers moving on to shallow ones
+                else:
+                    state, saliency_map = model.forward(x=clip[idx].detach(),
+                                                        prev_state=state.detach())  # Bas
+                saliency_map = saliency_map.squeeze(1)  # Target is 3 dimensional (grayscale image)
+                if saliency_map.size() != gtruths[idx].size():
+                    # print(saliency_map.size())
+                    # print(gtruths[idx].size())
+                    a, b, c, _ = saliency_map.size()
+                    saliency_map = torch.cat([saliency_map, torch.zeros(a, b, c, 1).cuda()],
+                                             3)  # because of upsampling we need to concatenate another column of zeroes. The original number is odd so it is impossible for upsampling to get an odd number as it scales by 2
 
-                    saliency_map = saliency_map.squeeze(0)  # Target is 3 dimensional (grayscale image)
-                    if saliency_map.size() != gtruths[idx].size():
-                        # print(saliency_map.size())
-                        # print(gtruths[idx].size())
-                        a, b, c, _ = saliency_map.size()
-                        saliency_map = torch.cat([saliency_map, torch.zeros(a, b, c, 1).cuda()],
-                                                 3)  # because of upsampling we need to concatenate another column of zeroes. The original number is odd so it is impossible for upsampling to get an odd number as it scales by 2
+                # Apply sigmoid before visualization
+                # logits will be whatever you have to rescale this
 
-                    # Apply sigmoid before visualization
-                    # logits will be whatever you have to rescale this
-
-                    # Compute loss
-                    loss = loss_sequences(saliency_map, gtruths[idx], gtruths_fix[idx])
-                    loss3+=loss[0]-0.1*loss[1]-0.1*loss[2]
-
-
-                # Keep score
-                loss3=loss3/b_size
-                accumulated_losses.append(loss3.data)
-
-                # Compute gradient
-                loss3.backward()
-
-                # Clip gradient to avoid explosive gradients. Gradients are accumulated so I went for a threshold that depends on clip length. Note that the loss that is stored in the score for printing does not include this clipping.
-                nn.utils.clip_grad_norm_(model.parameters(), 10 * clip.size()[0])
-
-                # Update parameters
-                optimizer.step()
-
-                # Repackage to avoid backpropagating further through time
-                state = repackage_hidden(state)
-
-            elif temporal and double:
-                if state == None:
-                    state = (None, None)
-                loss = 0
-                for idx in range(clip.size()[0]):
-                    # print(clip[idx].size())
-
-                    # Compute output
-                    state, saliency_map = model.forward(input_=clip[idx], prev_state_1=state[0], prev_state_2=state[
-                        1])  # Based on the number of epoch the model will unfreeze deeper layers moving on to shallow ones
-
-                    saliency_map = saliency_map.squeeze(0)  # Target is 3 dimensional (grayscale image)
-                    if saliency_map.size() != gtruths[idx].size():
-                        print(saliency_map.size())
-                        print(gtruths[idx].size())
-                        a, b, c, _ = saliency_map.size()
-                        saliency_map = torch.cat([saliency_map, torch.zeros(a, b, c, 1).cuda()],
-                                                 3)  # because of upsampling we need to concatenate another column of zeroes. The original number is odd so it is impossible for upsampling to get an odd number as it scales by 2
-
-                    # Apply sigmoid before visualization
-                    # logits will be whatever you have to rescale this
-
-                    # Compute loss
-                    loss=loss_sequences(saliency_map, gtruths[idx],gtruths_fix[idx])
-                    loss=loss[0]-0.1*loss[1]-0.1*loss[2]
-
-                # Keep score
-                accumulated_losses.append(loss.item())
-
-                # Compute gradient
+                # Compute loss
+                loss = loss_sequences(saliency_map, gtruths[idx], gtruths_fix[idx])
+                loss=(loss[0]-0.1*loss[1]-0.1*loss[2])/b_size
+                loss3 += loss
                 loss.backward()
 
-                # Clip gradient to avoid explosive gradients. Gradients are accumulated so I went for a threshold that depends on clip length. Note that the loss that is stored in the score for printing does not include this clipping.
-                nn.utils.clip_grad_norm_(model.parameters(), 10 * clip.size()[0])
 
-                # Update parameters
+
+            # Keep score
+            # loss3=loss3/b_size
+            accumulated_losses.append(loss3.data)
+
+            # Compute gradient
+            # loss3.backward()
+
+            # Clip gradient to avoid explosive gradients. Gradients are accumulated so I went for a threshold that depends on clip length. Note that the loss that is stored in the score for printing does not include this clipping.
+            nn.utils.clip_grad_norm_(model.parameters(), 10 * clip.size()[0])
+
+            # Update parameters
+            optimizer.step()
+
+            # Repackage to avoid backpropagating further through time
+            # state = repackage_hidden(state)
+
+        elif temporal and double:
+            if state == None:
+                state = (None, None)
+            loss = 0
+            for idx in range(clip.size()[0]):
+                # print(clip[idx].size())
+
+                # Compute output
+                state, saliency_map = model.forward(input_=clip[idx], prev_state_1=state[0], prev_state_2=state[
+                    1])  # Based on the number of epoch the model will unfreeze deeper layers moving on to shallow ones
+
+                saliency_map = saliency_map.squeeze(0)  # Target is 3 dimensional (grayscale image)
+                if saliency_map.size() != gtruths[idx].size():
+                    print(saliency_map.size())
+                    print(gtruths[idx].size())
+                    a, b, c, _ = saliency_map.size()
+                    saliency_map = torch.cat([saliency_map, torch.zeros(a, b, c, 1).cuda()],
+                                             3)  # because of upsampling we need to concatenate another column of zeroes. The original number is odd so it is impossible for upsampling to get an odd number as it scales by 2
+
+                # Apply sigmoid before visualization
+                # logits will be whatever you have to rescale this
+
+                # Compute loss
+                loss=loss_sequences(saliency_map, gtruths[idx],gtruths_fix[idx])
+                loss=loss[0]-0.1*loss[1]-0.1*loss[2]
+                loss.backward()
+
+            # Keep score
+            accumulated_losses.append(loss.item())
+
+            # Compute gradient
+
+
+            # Clip gradient to avoid explosive gradients. Gradients are accumulated so I went for a threshold that depends on clip length. Note that the loss that is stored in the score for printing does not include this clipping.
+            nn.utils.clip_grad_norm_(model.parameters(), 10 * clip.size()[0])
+
+            # Update parameters
+            optimizer.step()
+
+            # Repackage to avoid backpropagating further through time
+            state = repackage_hidden(state)
+
+        else:
+            # print(type(clip))
+            # print(clip.size())
+            for idx in range(clip.size()[0]):
+                saliency_map = model.forward(clip[idx])
+                saliency_map = saliency_map.squeeze(0)
+                loss = criterion(saliency_map, gtruths[idx])
+                loss.backward()
                 optimizer.step()
 
-                # Repackage to avoid backpropagating further through time
-                state = repackage_hidden(state)
+                accumulated_losses.append(loss.data)
 
-            else:
-                # print(type(clip))
-                # print(clip.size())
-                for idx in range(clip.size()[0]):
-                    saliency_map = model.forward(clip[idx])
-                    saliency_map = saliency_map.squeeze(0)
-                    loss = criterion(saliency_map, gtruths[idx])
-                    loss.backward()
-                    optimizer.step()
-
-                    accumulated_losses.append(loss.data)
-
-            # Visualize some of the data
-            if i % 100 == 0 and j == 5:
-
-                # writer.add_image('Frame', clip[idx], n_iter)
-                # writer.add_image('Gtruth', gtruths[idx], n_iter)
-
-                post_process_saliency_map = (saliency_map - torch.min(saliency_map)) / (
-                            torch.max(saliency_map) - torch.min(saliency_map))
-                utils.save_image(post_process_saliency_map, "./log/smap{}_epoch{}.png".format(i, epoch))
-
-                if epoch == 1:
-                    print(saliency_map.max())
-                    print(saliency_map.min())
-                    print(gtruths[idx].max())
-                    print(gtruths[idx].min())
-                    print(post_process_saliency_map.max())
-                    print(post_process_saliency_map.min())
-                    utils.save_image(gtruths[idx], "./log/gt{}.png".format(i))
-                # writer.add_image('Prediction', prediction, n_iter)
+        # Visualize some of the data
+        # if i % 100 == 0 and j == 5:
+        #
+        #     # writer.add_image('Frame', clip[idx], n_iter)
+        #     # writer.add_image('Gtruth', gtruths[idx], n_iter)
+        #
+        #     post_process_saliency_map = (saliency_map - torch.min(saliency_map)) / (
+        #                 torch.max(saliency_map) - torch.min(saliency_map))
+        #     utils.save_image(post_process_saliency_map, "./log/smap{}_epoch{}.png".format(i, epoch))
+        #
+        #     if epoch == 1:
+        #         print(saliency_map.max())
+        #         print(saliency_map.min())
+        #         print(gtruths[idx].max())
+        #         print(gtruths[idx].min())
+        #         print(post_process_saliency_map.max())
+        #         print(post_process_saliency_map.min())
+        #         utils.save_image(gtruths[idx], "./log/gt{}.png".format(i))
+        #     # writer.add_image('Prediction', prediction, n_iter)
 
         end = datetime.datetime.now().replace(microsecond=0)
         print('Epoch: {}\tVideo: {}\t Training Loss: {}\t Time elapsed: {}\t'.format(epoch, i, mean(accumulated_losses),
@@ -637,14 +682,14 @@ def validate(val_loader, model,epoch, temporal, dtype):
     video_losses = []
     print("Now running validation..")
     for i, video in enumerate(val_loader):
-        accumulated_losses = []
+        # accumulated_losses = []
         state = None  # Initially no hidden state
         with torch.no_grad():
-            for j, (clip, gtruths,gtruths_fix) in enumerate(video):
+            for j, (clip, gtruths,gtruths_fix) in enumerate(video[0:10]):
 
-                clip = Variable(clip.type(dtype).transpose(0, 1), requires_grad=False)
-                gtruths = Variable(gtruths.type(dtype).transpose(0, 1), requires_grad=False)
-                gtruths_fix=Variable(gtruths_fix.type(dtype).transpose(0, 1), requires_grad=False)
+                clip = Variable(clip.type(dtype).transpose(0, 1), requires_grad=False).cuda()
+                gtruths = Variable(gtruths.type(dtype).transpose(0, 1), requires_grad=False).cuda()
+                gtruths_fix=Variable(gtruths_fix.transpose(0, 1), requires_grad=False).cuda()
 
                 loss = 0
                 for idx in range(clip.size()[0]):
@@ -674,6 +719,9 @@ def validate(val_loader, model,epoch, temporal, dtype):
 
                 # Keep score
                 # accumulated_losses.append(loss.data)
+            # cc, nss, loss = summary.get_metrics()
+        # print('Epoch: {}\tVideo: {}\t cc {}\t nss: {}\t'.format(epoch, i, cc,nss))
+
 
             # video_losses.append(mean(accumulated_losses))
     cc,nss,loss=summary.get_metrics()
@@ -722,12 +770,14 @@ def train_img(train_loader, model, criterion, optimizer, epoch, n_iter, use_gpu,
         saliency_map = model.forward(img)  # Based on the number of epoch the model will unfreeze deeper layers moving on to shallow ones
         saliency_map = saliency_map.squeeze(1)  # Target is 3 dimensional (grayscale image)
 
-        loss = criterion(saliency_map, sal)
+        # loss = criterion(saliency_map, sal)
+        loss=loss_sequences(saliency_map, sal,fix)
+        loss=loss[0] - 0.1 * loss[1] - 0.1 * loss[2]
 
         loss=loss/accumulation_steps
 
         # Keep score
-        losses.append(loss.data*accumulation_steps)
+        losses.append(loss.item()*accumulation_steps)
 
         # Compute gradient
         loss.backward()
@@ -792,8 +842,13 @@ def val_img(val_loader, model, criterion, optimizer, epoch, n_iter, use_gpu, dou
         saliency_map = model.forward(img)  # Based on the number of epoch the model will unfreeze deeper layers moving on to shallow ones
         saliency_map = saliency_map.squeeze(1)  # Target is 3 dimensional (grayscale image)
 
-        loss = criterion(saliency_map, sal).cpu().detach().numpy()
-        saliency_map,fix=saliency_map.cpu().detach().numpy(),fix.cpu().detach().numpy()
+        # loss = criterion(saliency_map, sal).cpu().detach().numpy()
+        loss=loss_sequences(saliency_map, sal,fix)
+        loss=loss[0] - 0.1 * loss[1] - 0.1 * loss[2]
+        loss=loss.cpu().detach().numpy()
+
+
+        saliency_map,sal,fix=saliency_map.cpu().detach().numpy(),sal.cpu().detach().numpy(),fix.cpu().detach().numpy()
 
         # nss=metric.NSS(saliency_map,fix)
 
@@ -831,8 +886,8 @@ def val_img(val_loader, model, criterion, optimizer, epoch, n_iter, use_gpu, dou
         # if i==5:
         #     break
 
-    nss, loss = summary.get_metrics()
-    return (nss,loss,n_iter, optimizer)
+    cc,nss, loss = summary.get_metrics()
+    return (cc,nss,loss,n_iter, optimizer)
 
 
 if __name__ == '__main__':

@@ -148,6 +148,32 @@ def normalize(x, method='standard', axis=None):
             raise ValueError('method not in {"standard", "range", "sum"}')
     return res
 
+def SIM(saliency_map1, saliency_map2):
+    '''
+    Similarity between two different saliency maps when viewed as distributions
+    (SIM=1 means the distributions are identical).
+    This similarity measure is also called **histogram intersection**.
+    Parameters
+    ----------
+    saliency_map1 : real-valued matrix
+        If the two maps are different in shape, saliency_map1 will be resized to match saliency_map2.
+    saliency_map2 : real-valued matrix
+    Returns
+    -------
+    SIM : float, between [0,1]
+    '''
+    map1 = np.array(saliency_map1, copy=False)
+    map2 = np.array(saliency_map2, copy=False)
+    if map1.shape != map2.shape:
+        map1 = resize(map1, map2.shape, order=3, mode='nearest') # bi-cubic/nearest is what Matlab imresize() does by default
+    # Normalize the two maps to have values between [0,1] and sum up to 1
+    map1 = normalize(map1, method='range')
+    map2 = normalize(map2, method='range')
+    map1 = normalize(map1, method='sum')
+    map2 = normalize(map2, method='sum')
+    # Compute histogram intersection
+    intersection = np.minimum(map1, map2)
+    return np.sum(intersection)
 
 
 def NSS(saliency_map, fixation_map):

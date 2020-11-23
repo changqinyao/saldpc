@@ -137,7 +137,7 @@ def log_softmax(x):
 
 
 def nss(pred, fixations):
-    fixations=fixations>125
+    # fixations=fixations>125
     size = pred.size()
     new_size = (-1, size[-1] * size[-2])
     pred = pred.reshape(new_size)
@@ -181,8 +181,11 @@ def corr_coeff(pred, target):
 
 def kld_loss(pred, target):
     pred_sum,target_sum=pred.sum((2,1)),target.sum((2,1))
-    loss = F.kl_div((pred/pred_sum).log(), target/target_sum, reduction='batchmean')
-    # loss = loss.sum(-1).sum(-1)
+    # batch=pred.size()[0]
+    # pred, target=pred.view(batch,-1).log_softmax(dim=1),target.view(batch,-1).softmax(dim=1)
+    loss = F.kl_div((pred/pred_sum[:,None,None]).log(), target/target_sum[:,None,None], reduction='none')
+    # loss = loss.sum(-1)
+    loss = loss.sum(-1).sum(-1)
     return loss
 
 

@@ -64,19 +64,19 @@ def padding_fixation(img, shape_r=480, shape_c=640):
 
 
 
-def get_train_transforms():
+def get_train_transforms(height=192, width=256):
     return A.Compose(
         [
-            A.Resize(height=192, width=256, p=1.0),
+            A.Resize(height=height, width=width, p=1.0),
             A.Normalize(),
             ToTensorV2(p=1.0),
         ],
     )
 
-def get_val_transforms():
+def get_val_transforms(height=192, width=256):
     return A.Compose(
         [
-            A.Resize(height=192, width=256, p=1.0),
+            A.Resize(height=height, width=width, p=1.0),
             A.Normalize(),
             ToTensorV2(p=1.0),
         ],
@@ -227,8 +227,9 @@ class SALICONDataset(data.Dataset):
 # The DataLoader for our specific video datataset with extracted frames
 class DHF1K_frames(data.Dataset):
 
-  def __init__(self, split, clip_length, number_of_videos, starting_video, root_path, load_gt, resolution=None, val_perc = 0.01):
-        self.transforms=get_train_transforms()
+  def __init__(self, phase,split, clip_length, number_of_videos, starting_video, root_path, load_gt, resolution=None, val_perc = 0.01):
+        self.phase=phase
+
         self.starting_video = starting_video
         self.cl = clip_length
         self.frames_path = os.path.join(root_path) # in our case it's salgan saliency maps
@@ -237,6 +238,7 @@ class DHF1K_frames(data.Dataset):
           self.gt_path = os.path.join(root_path)#ground truth
         self.ImageNet_mean = [103.939, 116.779, 123.68]
         self.resolution = resolution
+        self.transforms = get_train_transforms(self.resolution[0],self.resolution[1])
         # A list to keep all video lists of salgan predictions, which will be our dataset.
         self.video_list = []
 
@@ -275,15 +277,28 @@ class DHF1K_frames(data.Dataset):
         # Split the dataset to validation and training
         limit = int(round(val_perc*len(self.video_list)))
         if split == "validation":
-          self.video_list = self.video_list[:limit]
-          self.gts_list = self.gts_list[:limit]
-          self.first_video_no = starting_video #This needs to be specified to find the correct directory in our case. It will be different for each split since these directories signify videos.
+          self.first_video_no = len(self.video_list) - limit+1
+          self.video_list = self.video_list[-limit:]
+          self.gts_list = self.gts_list[-limit:]
+           #This needs to be specified to find the correct directory in our case. It will be different for each split since these directories signify videos.
         elif split == "train":
-          self.video_list = self.video_list[limit:]
-          self.gts_list = self.gts_list[limit:]
-          self.first_video_no = limit+starting_video
+          self.video_list = self.video_list
+          self.gts_list = self.gts_list
+          self.first_video_no = starting_video
         elif split == None:
           self.first_video_no = starting_video
+
+
+        # if split == "validation":
+        #   self.video_list = self.video_list[:limit]
+        #   self.gts_list = self.gts_list[:limit]
+        #   self.first_video_no = starting_video #This needs to be specified to find the correct directory in our case. It will be different for each split since these directories signify videos.
+        # elif split == "train":
+        #   self.video_list = self.video_list[limit:]
+        #   self.gts_list = self.gts_list[limit:]
+        #   self.first_video_no = limit+starting_video
+        # elif split == None:
+        #   self.first_video_no = starting_video
 
 
 
@@ -307,55 +322,127 @@ class DHF1K_frames(data.Dataset):
         gt = []
         gt_fix=[]
         packed = []
-        for i, frame in enumerate(frames):
 
-          # Load and preprocess frames
-          path_to_frame = os.path.join(self.frames_path, str(true_index).rjust(4,'0'),'images', frame)
+        if self.phase=='train':
+            v = np.random.random()
+            start_idx = np.random.randint(0, len(frames)-self.cl)
+            for i, frame in enumerate(frames[start_idx:start_idx+self.cl]):
 
-          X = cv2.imread(path_to_frame,cv2.IMREAD_COLOR)
-          X = cv2.cvtColor(X, cv2.COLOR_BGR2RGB).astype(np.float32)
-          if self.resolution!=None:
-            # X = cv2.resize(X, (self.resolution[1], self.resolution[0]), interpolation=cv2.INTER_AREA)
-            X=self.transforms(image=X)['image']
-          # X = X.astype(np.float32)
-          # X -= self.ImageNet_mean
-          #X = (X-np.min(X))/(np.max(X)-np.min(X))
-          # X = torch.FloatTensor(X)
-          # X = X.permute(2,0,1) # swap channel dimensions
+              # Load and preprocess frames
+              path_to_frame = os.path.join(self.frames_path, str(true_index).rjust(4,'0'),'images', frame)
 
-          data.append(X.unsqueeze(0))
-          # Load and preprocess ground truth (saliency maps)
-          if self.load_gt:
+              X = cv2.imread(path_to_frame,cv2.IMREAD_COLOR)
+              X = cv2.cvtColor(X, cv2.COLOR_BGR2RGB).astype(np.float32)
+              if v<0.5:
+                  X = X[:, ::-1, ...]
+              if self.resolution!=None:
+                # X = cv2.resize(X, (self.resolution[1], self.resolution[0]), interpolation=cv2.INTER_AREA)
+                X=self.transforms(image=X)['image']
+              # X = X.astype(np.float32)
+              # X -= self.ImageNet_mean
+              #X = (X-np.min(X))/(np.max(X)-np.min(X))
+              # X = torch.FloatTensor(X)
+              # X = X.permute(2,0,1) # swap channel dimensions
+              data.append(X.unsqueeze(0))
+              # Load and preprocess ground truth (saliency maps)
+              if self.load_gt:
 
-            path_to_gt = os.path.join(self.gt_path, str(true_index).rjust(4,'0'),'maps', gts[frame])
-            path_to_gt_fix=os.path.join(self.gt_path, str(true_index).rjust(4,'0'),'fixation', gts[frame])
+                path_to_gt = os.path.join(self.gt_path, str(true_index).rjust(4,'0'),'maps', gts[frame])
+                path_to_gt_fix=os.path.join(self.gt_path, str(true_index).rjust(4,'0'),'fixation', gts[frame])
 
-            map = cv2.imread(str(path_to_gt), cv2.IMREAD_GRAYSCALE)
-            map = (map - np.min(map)) / (np.max(map) - np.min(map))
-            if self.resolution!=None:
-              map = cv2.resize(map, (self.resolution[1], self.resolution[0]), interpolation=cv2.INTER_AREA)
-            map = torch.FloatTensor(map)
+                map = cv2.imread(str(path_to_gt), cv2.IMREAD_GRAYSCALE)
+                map = (map - np.min(map)) / (np.max(map) - np.min(map))
+                if v < 0.5:
+                    map = map[:, ::-1]
 
-            fix_map = cv2.imread(str(path_to_gt_fix), cv2.IMREAD_GRAYSCALE)
-            fix_map = preprocess_fixmaps(fix_map, 192, 256)
-            fix_map = torch.FloatTensor(fix_map)
+                if self.resolution!=None:
+                  map = cv2.resize(map, (self.resolution[1], self.resolution[0]), interpolation=cv2.INTER_AREA)
+                map = torch.FloatTensor(map)
 
-            gt.append(map.unsqueeze(0))
-            gt_fix.append(fix_map.unsqueeze(0))
+                fix_map = cv2.imread(str(path_to_gt_fix), cv2.IMREAD_GRAYSCALE)
+                if v < 0.5:
+                    fix_map= fix_map[:, ::-1]
+                fix_map = preprocess_fixmaps(fix_map, 192, 256)
+                fix_map=fix_map>125
+                fix_map = torch.tensor(fix_map)
 
-          if (i+1)%self.cl == 0 or i == (len(frames)-1):
+                gt.append(map.unsqueeze(0))
+                gt_fix.append(fix_map.unsqueeze(0))
 
-            data_tensor = torch.cat(data,0)
-            data = []
-            if self.load_gt:
-              gt_tensor = torch.cat(gt,0)
-              gt_fix_tensor=torch.cat(gt_fix,0)
-              gt = []
-              gt_fix=[]
-              packed.append((data_tensor,gt_tensor,gt_fix_tensor)) # pack a list of data with the corresponding list of ground truths
-            else:
-              packed.append((data_tensor, "_"))
+              if (i+1)%self.cl == 0 or i == (len(frames)-1):
 
+                data_tensor = torch.cat(data,0)
+                data = []
+                if self.load_gt:
+                  gt_tensor = torch.cat(gt,0)
+                  gt_fix_tensor=torch.cat(gt_fix,0)
+                  gt = []
+                  gt_fix=[]
+                  packed.append((data_tensor,gt_tensor,gt_fix_tensor)) # pack a list of data with the corresponding list of ground truths
+                else:
+                  packed.append((data_tensor, "_"))
+
+        else:
+            for i, frame in enumerate(frames):
+
+                # Load and preprocess frames
+                path_to_frame = os.path.join(self.frames_path, str(true_index).rjust(4, '0'), 'images', frame)
+
+                X = cv2.imread(path_to_frame, cv2.IMREAD_COLOR)
+                X = cv2.cvtColor(X, cv2.COLOR_BGR2RGB).astype(np.float32)
+
+            #salema
+                # X = cv2.imread(path_to_frame)
+                # if self.resolution != None:
+                #     #salema
+                #     X = cv2.resize(X, (self.resolution[1], self.resolution[0]), interpolation=cv2.INTER_AREA)
+                # X = X.astype(np.float32)
+                # X -= self.ImageNet_mean
+                # X = torch.FloatTensor(X)
+                # X = X.permute(2, 0, 1)  # swap channel dimensions
+
+
+                if self.resolution != None:
+                     X = self.transforms(image=X)['image']
+
+                # X = (X-np.min(X))/(np.max(X)-np.min(X))
+                # X = torch.FloatTensor(X)
+
+
+                data.append(X.unsqueeze(0))
+                # Load and preprocess ground truth (saliency maps)
+                if self.load_gt:
+
+                    path_to_gt = os.path.join(self.gt_path, str(true_index).rjust(4, '0'), 'maps', gts[frame])
+                    path_to_gt_fix = os.path.join(self.gt_path, str(true_index).rjust(4, '0'), 'fixation', gts[frame])
+
+                    map = cv2.imread(str(path_to_gt), cv2.IMREAD_GRAYSCALE)
+                    map = (map - np.min(map)) / (np.max(map) - np.min(map))
+                    if self.resolution != None:
+                        map = cv2.resize(map, (self.resolution[1], self.resolution[0]), interpolation=cv2.INTER_AREA)
+                    map = torch.FloatTensor(map)
+
+                    fix_map = cv2.imread(str(path_to_gt_fix), cv2.IMREAD_GRAYSCALE)
+                    fix_map = preprocess_fixmaps(fix_map, 192, 256)
+                    fix_map = fix_map > 125
+                    fix_map = torch.tensor(fix_map)
+
+                    gt.append(map.unsqueeze(0))
+                    gt_fix.append(fix_map.unsqueeze(0))
+
+                if (i + 1) % self.cl == 0 or i == (len(frames) - 1):
+
+                    data_tensor = torch.cat(data, 0)
+                    data = []
+                    if self.load_gt:
+                        gt_tensor = torch.cat(gt, 0)
+                        gt_fix_tensor = torch.cat(gt_fix, 0)
+                        gt = []
+                        gt_fix = []
+                        packed.append((data_tensor, gt_tensor,
+                                       gt_fix_tensor))  # pack a list of data with the corresponding list of ground truths
+                    else:
+                        packed.append((data_tensor, "_"))
 
         return packed
 
