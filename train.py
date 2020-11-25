@@ -309,10 +309,10 @@ def main(args):
 
 
     # 加载静态
-    checkpoint = torch.load('salsepckl.pt')     #/home/ubuntu/Downloads/SalEMA30.pt
-    model.load_state_dict(checkpoint['state_dict'],strict=False)
-    # optimizer.load_state_dict(checkpoint['optimizer'])
-    # max_val_nss = checkpoint['val_nss']
+    checkpoint = torch.load('SalsepcEMA1.pt')     #/home/ubuntu/Downloads/SalEMA30.pt
+    model.load_state_dict(checkpoint['state_dict'],strict=True)
+    optimizer.load_state_dict(checkpoint['optimizer'])
+    max_val_nss = checkpoint['val_nss']
 
     # load_model('/home/ubuntu/Downloads/SalEMA30.pt', model)
     if args.dataset == "salicon":

@@ -362,7 +362,7 @@ class DHF1K_frames(data.Dataset):
                 fix_map = cv2.imread(str(path_to_gt_fix), cv2.IMREAD_GRAYSCALE)
                 if v < 0.5:
                     fix_map= fix_map[:, ::-1]
-                fix_map = preprocess_fixmaps(fix_map, 192, 256)
+                fix_map = preprocess_fixmaps(fix_map, self.resolution[0],self.resolution[1])
                 fix_map=fix_map>125
                 fix_map = torch.tensor(fix_map)
 
@@ -423,7 +423,7 @@ class DHF1K_frames(data.Dataset):
                     map = torch.FloatTensor(map)
 
                     fix_map = cv2.imread(str(path_to_gt_fix), cv2.IMREAD_GRAYSCALE)
-                    fix_map = preprocess_fixmaps(fix_map, 192, 256)
+                    fix_map = preprocess_fixmaps(fix_map, self.resolution[0],self.resolution[1])
                     fix_map = fix_map > 125
                     fix_map = torch.tensor(fix_map)
 

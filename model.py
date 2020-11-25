@@ -36,11 +36,11 @@ class salSEPCema(nn.Module):
         x=self.backbone(x)
         x=self.fpn(x)
         if prev_state is None:
-            current_state = x[2]
+            current_state = x[1]
         else:
-            current_state = torch.sigmoid(self.alpha) * x[2] + (1 - torch.sigmoid(self.alpha)) * prev_state
+            current_state = torch.sigmoid(self.alpha) * x[1] + (1 - torch.sigmoid(self.alpha)) * prev_state
         x=list(x)
-        x[2]=current_state
+        x[1]=current_state
         x=self.sepc(x)
         x=F.relu(self.gn1(self.semantic_branch(x[0]+x[1]+x[2]+x[3]+x[4])))
         x=self.output(x)
