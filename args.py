@@ -54,7 +54,7 @@ def get_training_parser():
     # Args for EMA
     parser.add_argument('-alpha', dest='alpha', default=None, help='Input value for alpha. Set to None in order for the model to learn alpha (recommended).')
     parser.add_argument('-ema_loc', dest='ema_loc', default=30, type=int, help='Input number of layer to place EMA on')
-    parser.add_argument('-dropout', dest='dropout', default=True, type=bool, help='Boolean value set to True if model includes dropout.')
+    parser.add_argument('-dropout', dest='dropout', default=False, type=bool, help='Boolean value set to True if model includes dropout.')
     parser.add_argument('-residual', dest='residual', default=False, type=bool, help='Boolean value set to True if model includes residual connection on SalEMA')
     parser.add_argument('-double_ema', dest='double_ema', default=False, help="Set to False if you're not using two EMAs. If you want to use2 EMAs, use the number upon which you want the second ema to be located at")
 

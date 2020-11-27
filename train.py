@@ -17,7 +17,7 @@ from torch.utils import data
 from torch.autograd import Variable
 from data_loader import DHF1K_frames, Hollywood_frames,SALICONDataset
 
-from model import salSEPC,salSEPCema,SalEMA
+from model import salSEPC,salSEPCema,SalEMA,SalGAN,salSEPCCCLSTM
 import metric
 from utils import nss,kld_loss,corr_coeff
 
@@ -188,14 +188,14 @@ def main(args):
     # The seed pertains to initializing the weights with a normal distribution
     # Using brute force for 100 seeds I found the number 65 to provide a good starting point (one that looks close to a saliency map predicted by the original SalGAN)
     temporal = True
-    if 'CLSTM56' in args.new_model:
-        model = SalGANmore.SalGANplus(seed_init=65, freeze=args.thaw)
+    if 'CCLSTM' in args.new_model:
+        model = salSEPCCCLSTM(backbone_name='res2net')
         print("Initialized {}".format(args.new_model))
     elif 'CLSTM30' in args.new_model:
         model = SalGANmore.SalCLSTM30(seed_init=65, residual=args.residual, freeze=args.thaw)
         print("Initialized {}".format(args.new_model))
     elif 'SalBCE' in args.new_model:
-        model = SalGANmore.SalGAN()
+        model = SalGAN()
         print("Initialized {}".format(args.new_model))
         temporal = False
     elif 'EMA' in args.new_model:
@@ -204,7 +204,7 @@ def main(args):
             print("Initialized {}".format(args.new_model))
         else:
             if args.dataset=='DHF1K':
-                model = salSEPCema(alpha=None,backbone_name='res2net')
+                model = salSEPCema(alpha=args.alpha,backbone_name='res2net')
                 # model = SalEMA(alpha=args.alpha,residual=args.residual, dropout= args.dropout, ema_loc=args.ema_loc)
             if args.dataset=='salicon':
                 model = salSEPC(backbone_name='res2net')
@@ -220,6 +220,7 @@ def main(args):
     # optimizer = torch.optim.RMSprop(model.parameters(), args.lr, alpha=0.99, eps=1e-08, momentum=momentum, weight_decay=weight_decay)
     # start
     bceloss = nn.BCELoss()
+    mseloss=nn.MSELoss()
 
     if args.thaw:
         # Load only the unfrozen part to the optimizer
@@ -237,38 +238,38 @@ def main(args):
         # optimizer = torch.optim.Adam(model.parameters(), args.lr, betas=(0.9, 0.999), eps=1e-08, weight_decay=weight_decay)
 
         pg0,pg1,pg2=[],[],[]
-        if args.alpha is None:
-            for k, v in model.named_parameters():
-                # v.requires_grad = True
-                if k=='alpha':
-                    continue
+        # if args.alpha is None:
+        for k, v in model.named_parameters():
+            # v.requires_grad = True
+            if k=='alpha':
+                continue
+            else:
+                if '.bias' in k:
+                    pg2.append(v)  # biases
+                elif '.weight' in k and '.bn' not in k:
+                    pg1.append(v)  # apply weight decay
                 else:
-                    if '.bias' in k:
-                        pg2.append(v)  # biases
-                    elif '.weight' in k and '.bn' not in k:
-                        pg1.append(v)  # apply weight decay
-                    else:
-                        pg0.append(v)  # all else
-            optimizer = torch.optim.Adam(pg0, lr=args.lr, betas=(0.937, 0.999))
-            optimizer.add_param_group({'params': pg1, 'weight_decay': weight_decay})  # add pg1 with weight_decay
-            optimizer.add_param_group({'params': pg2})  # add pg2 (biases)
-            if hasattr(model, 'alpha'):
-                optimizer.add_param_group({'params': model.alpha, 'lr': 0.1})
-            del pg0, pg1, pg2
+                    pg0.append(v)  # all else
+        optimizer = torch.optim.Adam(pg0, lr=args.lr, betas=(0.937, 0.999))
+        optimizer.add_param_group({'params': pg1, 'weight_decay': weight_decay})  # add pg1 with weight_decay
+        optimizer.add_param_group({'params': pg2})  # add pg2 (biases)
+        # if hasattr(model, 'alpha'):
+        #     optimizer.add_param_group({'params': model.alpha, 'lr': 0.1})
+        del pg0, pg1, pg2
 
             # optimizer = torch.optim.Adam([
             #     {'params': model.salgan.parameters(), 'lr': args.lr, 'weight_decay': weight_decay},
             #     {'params': model.alpha, 'lr': 0.1}])
 
-        else:
-            optimizer = torch.optim.Adam([
-                {'params': model.salgan.parameters(), 'lr': args.lr, 'weight_decay': weight_decay}])
+        # else:
+        #     optimizer = torch.optim.Adam([
+        #         {'params': model.salgan.parameters(), 'lr': args.lr, 'weight_decay': weight_decay}])
 
         if LEARN_ALPHA_ONLY:
             optimizer = torch.optim.Adam([{'params': [model.alpha]}], 0.1)
 
 
-    scheduler =torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer,mode='max',patience=3)
+    scheduler =torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer,mode='max',patience=5)
     if args.pt_model == None:
         # In truth it's not None, we default to SalGAN or SalBCE (JuanJo's)weights
         # By setting strict to False we allow the model to load only the matching layers' weights
@@ -302,22 +303,23 @@ def main(args):
         dtype = torch.cuda.FloatTensor
         cudnn.benchmark = True  # https://discuss.pytorch.org/t/what-does-torch-backends-cudnn-benchmark-do/5936
         # criterion = criterion.cuda()
-        bceloss=bceloss.cuda()
+        mseloss=mseloss.cuda()
     # =================================================
     # ================== Training =====================
     max_val_nss = float('-inf')
 
 
     # 加载静态
-    checkpoint = torch.load('SalsepcEMA1.pt')     #/home/ubuntu/Downloads/SalEMA30.pt
-    model.load_state_dict(checkpoint['state_dict'],strict=True)
-    optimizer.load_state_dict(checkpoint['optimizer'])
+    checkpoint = torch.load('SalsepcEMA1flip.pt')     #/home/ubuntu/Downloads/SalEMA30.pt
+    model.load_state_dict(checkpoint['state_dict'],strict=False)
+    model.reset(args.alpha)
+    # optimizer.load_state_dict(checkpoint['optimizer'])
     max_val_nss = checkpoint['val_nss']
 
-    # load_model('/home/ubuntu/Downloads/SalEMA30.pt', model)
-    if args.dataset == "salicon":
-        optimizer.load_state_dict(checkpoint['optimizer'])
-        max_val_nss=checkpoint['val_nss']
+    # load_model('/home/ubuntu/Downloads/SalBCE.pt', model)
+    # if args.dataset == "salicon":
+    #     optimizer.load_state_dict(checkpoint['optimizer'])
+    #     max_val_nss=checkpoint['val_nss']
 
     train_losses = []
     val_nsses = []
@@ -335,16 +337,16 @@ def main(args):
             # adjust_learning_rate(optimizer, epoch, decay_rate) #Didn't use this after all
             # train for one epoch
         if args.dataset == "salicon":
-            train_loss, n_iter, optimizer = train_img(train_loader, model, bceloss, optimizer, epoch, n_iter,
-                                                  args.use_gpu, args.double_ema, args.thaw, temporal, dtype)
-            #
-            print("Epoch {}/{} done with train loss {}\n".format(epoch, args.epochs, train_loss))
+            train_loss, n_iter, optimizer = train_img(train_loader, model, mseloss, optimizer, epoch, n_iter,
+                                                  args.use_gpu, args.double_ema, args.thaw, temporal, dtype,args.new_model)
+            # #
+            # print("Epoch {}/{} done with train loss {}\n".format(epoch, args.epochs, train_loss))
 
             if args.val_perc > 0:
                 print("Running validation..")
                 with torch.no_grad():
-                    cc,nss,loss,n_iter, optimizer = val_img(val_loader, model, bceloss, optimizer, epoch, n_iter,
-                                                      args.use_gpu, args.double_ema, args.thaw, temporal, dtype)
+                    cc,nss,loss,n_iter, optimizer = val_img(val_loader, model, mseloss, optimizer, epoch, n_iter,
+                                                      args.use_gpu, args.double_ema, args.thaw, temporal, dtype,args.new_model)
                 print("Epoch{}\tValidation loss: {}\t nss : {}\t:{}".format(epoch,loss,nss,cc))
                 scheduler.step(nss)
 
@@ -359,7 +361,7 @@ def main(args):
                     'state_dict': model.cpu().state_dict(),
                     'optimizer': optimizer.state_dict(),
                     'val_nss':max_val_nss
-                }, 'salsepckl' + ".pt")
+                }, 'salCCLSTMklpre' + ".pt")
 
             if args.use_gpu == 'parallel':
                 model = nn.DataParallel(model).cuda()
@@ -382,13 +384,13 @@ def main(args):
         #     break
         if args.dataset == "DHF1K":
             train_loss, n_iter, optimizer = train(train_loader, model, bceloss, optimizer, epoch, n_iter,
-                                                  args.use_gpu, args.double_ema, args.thaw, temporal, dtype)
+                                                  args.use_gpu, args.double_ema, args.thaw, temporal, dtype,args.new_model)
 
             print("Epoch {}/{} done with train loss {}\n".format(epoch, args.epochs, train_loss))
 
             if args.val_perc > 0:
                 print("Running validation..")
-                cc,nss,val_loss = validate(val_loader, model,epoch, temporal, dtype)
+                cc,nss,val_loss = validate(val_loader, model,epoch, temporal, dtype,args.new_model)
                 print("Validation loss: {}\t nss : {}\t cc:{}".format(val_loss,nss,cc))
                 scheduler.step(nss)
 
@@ -494,7 +496,7 @@ def repackage_hidden(h):
         return tuple(repackage_hidden(v) for v in h)
 
 
-def train(train_loader, model, criterion, optimizer, epoch, n_iter, use_gpu, double, thaw, temporal, dtype):
+def train(train_loader, model, criterion, optimizer, epoch, n_iter, use_gpu, double, thaw, temporal, dtype,modelname):
     # Switch to train mode
     model.train()
 
@@ -526,7 +528,10 @@ def train(train_loader, model, criterion, optimizer, epoch, n_iter, use_gpu, dou
         accumulated_losses = []
         start = datetime.datetime.now().replace(microsecond=0)
         # print("Number of clips for video {} : {}".format(i, len(video)))
-        state = None  # Initially no hidden state
+        prev_x = None  # Initially no hidden state
+        prev_h=None
+        prev_c=None
+        state=None
 
 
         # for j, (clip, gtruths,gtruths_fix) in enumerate(video):
@@ -554,11 +559,22 @@ def train(train_loader, model, criterion, optimizer, epoch, n_iter, use_gpu, dou
 
                 # Compute output
                 if state is None:
-                    state, saliency_map = model.forward(x=clip[idx].detach(),
+                    if 'CCLSTM' in modelname:
+                        (prev_h,prev_c,prev_x),saliency_map = model.forward(x=clip[idx],
+                                                            prev_h=prev_h,prev_c=prev_c,prev_x=prev_x)
+                        state=(prev_h,prev_c)
+                    else:
+                        state, saliency_map = model.forward(x=clip[idx].detach(),
                                                         prev_state=state)  # Based on the number of epoch the model will unfreeze deeper layers moving on to shallow ones
                 else:
-                    state, saliency_map = model.forward(x=clip[idx].detach(),
-                                                        prev_state=state.detach())  # Bas
+                    if 'CCLSTM' in modelname:
+                        (prev_h, prev_c, prev_x), saliency_map = model.forward(x=clip[idx],
+                                                                             prev_h=prev_h, prev_c=prev_c,
+                                                                             prev_x=prev_x)
+                        state = (prev_h, prev_c)
+                    else:
+                        state, saliency_map = model.forward(x=clip[idx].detach(),
+                                                            prev_state=state.detach())  # Bas
                 saliency_map = saliency_map.squeeze(1)  # Target is 3 dimensional (grayscale image)
                 if saliency_map.size() != gtruths[idx].size():
                     # print(saliency_map.size())
@@ -575,6 +591,10 @@ def train(train_loader, model, criterion, optimizer, epoch, n_iter, use_gpu, dou
                 loss=(loss[0]-0.1*loss[1]-0.1*loss[2])/b_size
                 loss3 += loss
                 loss.backward()
+
+                # prev_h = tuple(i.detach() for i in prev_h)
+                # prev_c = tuple(i.detach() for i in prev_c)
+                # prev_x = tuple(i.detach() for i in prev_x)
 
 
 
@@ -675,7 +695,7 @@ def train(train_loader, model, criterion, optimizer, epoch, n_iter, use_gpu, dou
 
     return (mean(video_losses), n_iter, optimizer)
 
-def validate(val_loader, model,epoch, temporal, dtype):
+def validate(val_loader, model,epoch, temporal, dtype,modelname):
     # switch to evaluate mode
     model.eval()
     summary=Meter()
@@ -684,6 +704,9 @@ def validate(val_loader, model,epoch, temporal, dtype):
     for i, video in enumerate(val_loader):
         # accumulated_losses = []
         state = None  # Initially no hidden state
+        prev_x = None  # Initially no hidden state
+        prev_h = None
+        prev_c = None
         with torch.no_grad():
             for j, (clip, gtruths,gtruths_fix) in enumerate(video[0:10]):
 
@@ -691,12 +714,19 @@ def validate(val_loader, model,epoch, temporal, dtype):
                 gtruths = Variable(gtruths.type(dtype).transpose(0, 1), requires_grad=False).cuda()
                 gtruths_fix=Variable(gtruths_fix.transpose(0, 1), requires_grad=False).cuda()
 
-                loss = 0
+                # loss = 0
                 for idx in range(clip.size()[0]):
                     # print(clip[idx].size()) needs unsqueeze
                     # Compute output
                     if temporal:
-                        state, saliency_map = model.forward(clip[idx], state)
+                        if 'CCLSTM' in modelname:
+                            (prev_h, prev_c, prev_x), saliency_map = model.forward(x=clip[idx],
+                                                                                   prev_h=prev_h, prev_c=prev_c,
+                                                                                   prev_x=prev_x)
+                            # state = (prev_h, prev_c)
+                        else:
+                            state, saliency_map = model.forward(x=clip[idx],
+                                                                prev_state=state)  # Based on the number of epoch the model will unfreeze deeper layers moving on to shallow ones
                     else:
                         saliency_map = model.forward(clip[idx])
 
@@ -714,8 +744,8 @@ def validate(val_loader, model,epoch, temporal, dtype):
                     saliency_map,sal,fix=saliency_map.cpu().detach().numpy(), gtruths[idx].cpu().detach().numpy(), gtruths_fix[idx].cpu().detach().numpy()
                     summary.update(saliency_map,sal,fix, (loss[0]-0.1*loss[1]-0.1*loss[2]).item())
 
-                if temporal:
-                    state = repackage_hidden(state)
+                # if temporal:
+                #     state = repackage_hidden(state)
 
                 # Keep score
                 # accumulated_losses.append(loss.data)
@@ -730,7 +760,7 @@ def validate(val_loader, model,epoch, temporal, dtype):
 
 
 
-def train_img(train_loader, model, criterion, optimizer, epoch, n_iter, use_gpu, double, thaw, temporal, dtype):
+def train_img(train_loader, model, criterion, optimizer, epoch, n_iter, use_gpu, double, thaw, temporal, dtype,modelname):
     # Switch to train mode
     accumulation_steps=4
     model.train()
@@ -745,6 +775,12 @@ def train_img(train_loader, model, criterion, optimizer, epoch, n_iter, use_gpu,
             continue
         """
         # print(type(video))
+        prev_x = None  # Initially no hidden state
+        prev_h = None
+        prev_c = None
+
+
+
         img=img['image']
         img,sal,fix=img.cuda(),sal.cuda(),fix.cuda()
         start = datetime.datetime.now().replace(microsecond=0)
@@ -767,12 +803,18 @@ def train_img(train_loader, model, criterion, optimizer, epoch, n_iter, use_gpu,
             # print(clip[idx].size())
 
             # Compute output
-        saliency_map = model.forward(img)  # Based on the number of epoch the model will unfreeze deeper layers moving on to shallow ones
-        saliency_map = saliency_map.squeeze(1)  # Target is 3 dimensional (grayscale image)
 
-        # loss = criterion(saliency_map, sal)
-        loss=loss_sequences(saliency_map, sal,fix)
-        loss=loss[0] - 0.1 * loss[1] - 0.1 * loss[2]
+        if 'CCLSTM' in modelname:
+            (prev_h, prev_c, prev_x), saliency_map = model.forward(x=img,
+                                                                   prev_h=prev_h, prev_c=prev_c, prev_x=prev_x)
+            saliency_map = saliency_map.squeeze(1)
+        else:
+            saliency_map = model.forward(img)  # Based on the number of epoch the model will unfreeze deeper layers moving on to shallow ones
+            saliency_map = saliency_map.squeeze(1)  # Target is 3 dimensional (grayscale image)
+
+        loss = criterion(saliency_map, sal)
+        # loss=loss_sequences(saliency_map, sal,fix)
+        # loss=loss[0] - 0.1 * loss[1] - 0.1 * loss[2]
 
         loss=loss/accumulation_steps
 
@@ -811,14 +853,14 @@ def train_img(train_loader, model, criterion, optimizer, epoch, n_iter, use_gpu,
         #     # writer.add_image('Prediction', prediction, n_iter)
 
         end = datetime.datetime.now().replace(microsecond=0)
-        if i%50==0:
+        if (i+1)%50==0:
             print('Epoch: {}\t step:{}\t Training Loss: {}\t Time elapsed: {}\t'.format(epoch,i,mean(losses),
                                                                                      end - start))
 
     return (mean(losses), n_iter, optimizer)
 
 
-def val_img(val_loader, model, criterion, optimizer, epoch, n_iter, use_gpu, double, thaw, temporal, dtype):
+def val_img(val_loader, model, criterion, optimizer, epoch, n_iter, use_gpu, double, thaw, temporal, dtype,modelname):
     # Switch to train mode
     model.eval()
     summary=Meter()
@@ -831,6 +873,9 @@ def val_img(val_loader, model, criterion, optimizer, epoch, n_iter, use_gpu, dou
             continue
         """
         # print(type(video))
+        prev_x = None  # Initially no hidden state
+        prev_h = None
+        prev_c = None
 
         img=img['image']
         img,sal,fix=img.cuda(),sal.cuda(),fix.cuda()
@@ -839,13 +884,18 @@ def val_img(val_loader, model, criterion, optimizer, epoch, n_iter, use_gpu, dou
         n_iter += i
 
             # Compute output
-        saliency_map = model.forward(img)  # Based on the number of epoch the model will unfreeze deeper layers moving on to shallow ones
-        saliency_map = saliency_map.squeeze(1)  # Target is 3 dimensional (grayscale image)
+        if 'CCLSTM' in modelname:
+            (prev_h, prev_c, prev_x), saliency_map = model.forward(x=img,
+                                                                   prev_h=prev_h, prev_c=prev_c, prev_x=prev_x)
+            saliency_map = saliency_map.squeeze(1)
+        else:
+            saliency_map = model.forward(img)  # Based on the number of epoch the model will unfreeze deeper layers moving on to shallow ones
+            saliency_map = saliency_map.squeeze(1)  # Target is 3 dimensional (grayscale image)
 
-        # loss = criterion(saliency_map, sal).cpu().detach().numpy()
-        loss=loss_sequences(saliency_map, sal,fix)
-        loss=loss[0] - 0.1 * loss[1] - 0.1 * loss[2]
-        loss=loss.cpu().detach().numpy()
+        loss = criterion(saliency_map, sal).cpu().detach().numpy()
+        # loss=loss_sequences(saliency_map, sal,fix)
+        # loss=loss[0] - 0.1 * loss[1] - 0.1 * loss[2]
+        # loss=loss.cpu().detach().numpy()
 
 
         saliency_map,sal,fix=saliency_map.cpu().detach().numpy(),sal.cpu().detach().numpy(),fix.cpu().detach().numpy()
@@ -885,6 +935,8 @@ def val_img(val_loader, model, criterion, optimizer, epoch, n_iter, use_gpu, dou
         # end = datetime.datetime.now().replace(microsecond=0)
         # if i==5:
         #     break
+        if i==300:
+            break
 
     cc,nss, loss = summary.get_metrics()
     return (cc,nss,loss,n_iter, optimizer)
