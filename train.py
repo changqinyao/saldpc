@@ -31,7 +31,7 @@ momentum = 0.9
 weight_decay = 1e-4
 # epochs = 7+1 #+3+2
 plot_every = 1
-clip_length = 20
+clip_length = 8
 
 # temporal = True
 # RESIDUAL = False
@@ -42,7 +42,7 @@ LEARN_ALPHA_ONLY = False
 # EMA_LOC_2 = 54
 # PROCESS = 'parallel'
 # Parameters
-params_train = {'batch_size': 6,
+params_train = {'batch_size': 1,
            'shuffle':True,
           # number of videos / batch, I need to implement padding if I want to do more than 1, but with DataParallel it's quite messy
           'num_workers': 4,
@@ -204,7 +204,7 @@ def main(args):
             print("Initialized {}".format(args.new_model))
         else:
             if args.dataset=='DHF1K':
-                model = salSEPCema(alpha=args.alpha,backbone_name='res2net')
+                model = salSEPCema(alpha=args.alpha,backbone_name='res2net',mema=args.mema)
                 # model = SalEMA(alpha=args.alpha,residual=args.residual, dropout= args.dropout, ema_loc=args.ema_loc)
             if args.dataset=='salicon':
                 model = salSEPC(backbone_name='res2net')
@@ -238,10 +238,12 @@ def main(args):
         # optimizer = torch.optim.Adam(model.parameters(), args.lr, betas=(0.9, 0.999), eps=1e-08, weight_decay=weight_decay)
 
         pg0,pg1,pg2=[],[],[]
+        # pga=[]
         # if args.alpha is None:
         for k, v in model.named_parameters():
             # v.requires_grad = True
-            if k=='alpha':
+            if 'alpha' in k:
+                # pga.append(v)
                 continue
             else:
                 if '.bias' in k:
@@ -253,8 +255,8 @@ def main(args):
         optimizer = torch.optim.Adam(pg0, lr=args.lr, betas=(0.937, 0.999))
         optimizer.add_param_group({'params': pg1, 'weight_decay': weight_decay})  # add pg1 with weight_decay
         optimizer.add_param_group({'params': pg2})  # add pg2 (biases)
-        # if hasattr(model, 'alpha'):
-        #     optimizer.add_param_group({'params': model.alpha, 'lr': 0.1})
+        if hasattr(model, 'alpha'):
+            optimizer.add_param_group({'params': model.alpha, 'lr': 0.1})
         del pg0, pg1, pg2
 
             # optimizer = torch.optim.Adam([
@@ -269,7 +271,7 @@ def main(args):
             optimizer = torch.optim.Adam([{'params': [model.alpha]}], 0.1)
 
 
-    scheduler =torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer,mode='max',patience=5)
+    scheduler =torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer,patience=3,verbose=True)
     if args.pt_model == None:
         # In truth it's not None, we default to SalGAN or SalBCE (JuanJo's)weights
         # By setting strict to False we allow the model to load only the matching layers' weights
@@ -310,10 +312,11 @@ def main(args):
 
 
     # 加载静态
-    checkpoint = torch.load('SalsepcEMA1flip.pt')     #/home/ubuntu/Downloads/SalEMA30.pt
-    model.load_state_dict(checkpoint['state_dict'],strict=False)
-    model.reset(args.alpha)
-    # optimizer.load_state_dict(checkpoint['optimizer'])
+    checkpoint = torch.load('SalsepcCCLSTM.pt')     #/home/ubuntu/Downloads/SalEMA30.pt
+    model.load_state_dict(checkpoint['state_dict'],strict=True)
+    # model.unfreeze()
+    # model.reset(args.alpha)
+    optimizer.load_state_dict(checkpoint['optimizer'])
     max_val_nss = checkpoint['val_nss']
 
     # load_model('/home/ubuntu/Downloads/SalBCE.pt', model)
@@ -383,16 +386,18 @@ def main(args):
         #     epoch = epoch - 1
         #     break
         if args.dataset == "DHF1K":
-            train_loss, n_iter, optimizer = train(train_loader, model, bceloss, optimizer, epoch, n_iter,
+            train_loss, n_iter, optimizer = train(train_loader, model, mseloss, optimizer, epoch, n_iter,
                                                   args.use_gpu, args.double_ema, args.thaw, temporal, dtype,args.new_model)
 
             print("Epoch {}/{} done with train loss {}\n".format(epoch, args.epochs, train_loss))
+            if 'CCLSTM' not in args.new_model:
+                print("'alpha:{}\n".format(model.alpha.data))
 
             if args.val_perc > 0:
                 print("Running validation..")
-                cc,nss,val_loss = validate(val_loader, model,epoch, temporal, dtype,args.new_model)
+                cc,nss,val_loss = validate(val_loader, model,mseloss,epoch, temporal, dtype,args.new_model)
                 print("Validation loss: {}\t nss : {}\t cc:{}".format(val_loss,nss,cc))
-                scheduler.step(nss)
+                scheduler.step(train_loss)
 
             # if epoch % plot_every == 0:
             #     train_losses.append(train_loss.cpu())
@@ -517,6 +522,8 @@ def train(train_loader, model, criterion, optimizer, epoch, n_iter, use_gpu, dou
 
     video_losses = []
     print("Now commencing epoch {}".format(epoch))
+    # Reset Gradients
+    optimizer.zero_grad()
     for i, video in enumerate(train_loader):
         """
         if i == 956 or i == 957:
@@ -538,8 +545,6 @@ def train(train_loader, model, criterion, optimizer, epoch, n_iter, use_gpu, dou
 
         # n_iter += j
 
-        # Reset Gradients
-        optimizer.zero_grad()
 
         # Squeeze out the video dimension
         # [video_batch, clip_length, channels, height, width]
@@ -552,6 +557,11 @@ def train(train_loader, model, criterion, optimizer, epoch, n_iter, use_gpu, dou
 
         if temporal and not double:
             # print(clip.size()) #works! torch.Size([5, 1, 1, 360, 640])
+            # if 'CCLSTM' in modelname:
+            #     clips=clip.split(8,0)
+            #     num_clips=len(clips)
+
+
             loss3 = 0
             b_size=clip.size()[0]
             for idx in range(b_size):
@@ -574,7 +584,7 @@ def train(train_loader, model, criterion, optimizer, epoch, n_iter, use_gpu, dou
                         state = (prev_h, prev_c)
                     else:
                         state, saliency_map = model.forward(x=clip[idx].detach(),
-                                                            prev_state=state.detach())  # Bas
+                                                            prev_state=state)  # Bas
                 saliency_map = saliency_map.squeeze(1)  # Target is 3 dimensional (grayscale image)
                 if saliency_map.size() != gtruths[idx].size():
                     # print(saliency_map.size())
@@ -588,10 +598,14 @@ def train(train_loader, model, criterion, optimizer, epoch, n_iter, use_gpu, dou
 
                 # Compute loss
                 loss = loss_sequences(saliency_map, gtruths[idx], gtruths_fix[idx])
+                mseloss = criterion(saliency_map, gtruths[idx])
+
                 loss=(loss[0]-0.1*loss[1]-0.1*loss[2])/b_size
                 loss3 += loss
-                loss.backward()
 
+                # state=tuple(i.detach() for i in state)
+                # loss.backward()
+                #
                 # prev_h = tuple(i.detach() for i in prev_h)
                 # prev_c = tuple(i.detach() for i in prev_c)
                 # prev_x = tuple(i.detach() for i in prev_x)
@@ -603,13 +617,20 @@ def train(train_loader, model, criterion, optimizer, epoch, n_iter, use_gpu, dou
             accumulated_losses.append(loss3.data)
 
             # Compute gradient
-            # loss3.backward()
+            # loss3=loss3/8 #梯度累加
+            loss3.backward()
 
             # Clip gradient to avoid explosive gradients. Gradients are accumulated so I went for a threshold that depends on clip length. Note that the loss that is stored in the score for printing does not include this clipping.
             nn.utils.clip_grad_norm_(model.parameters(), 10 * clip.size()[0])
 
             # Update parameters
-            optimizer.step()
+            if (i+1)%1==0:
+                optimizer.step()
+                optimizer.zero_grad()
+                end = datetime.datetime.now().replace(microsecond=0)
+                print('Epoch: {}\tVideo: {}\t Training Loss: {}\t Time elapsed: {}\t'.format(epoch, i,
+                                                                                             mean(accumulated_losses),
+                                                                                             end - start))
 
             # Repackage to avoid backpropagating further through time
             # state = repackage_hidden(state)
@@ -688,27 +709,29 @@ def train(train_loader, model, criterion, optimizer, epoch, n_iter, use_gpu, dou
         #         utils.save_image(gtruths[idx], "./log/gt{}.png".format(i))
         #     # writer.add_image('Prediction', prediction, n_iter)
 
-        end = datetime.datetime.now().replace(microsecond=0)
-        print('Epoch: {}\tVideo: {}\t Training Loss: {}\t Time elapsed: {}\t'.format(epoch, i, mean(accumulated_losses),
-                                                                                     end - start))
+        # end = datetime.datetime.now().replace(microsecond=0)
+        # print('Epoch: {}\tVideo: {}\t Training Loss: {}\t Time elapsed: {}\t'.format(epoch, i, mean(accumulated_losses),
+        #                                                                              end - start))
         video_losses.append(mean(accumulated_losses))
 
     return (mean(video_losses), n_iter, optimizer)
 
-def validate(val_loader, model,epoch, temporal, dtype,modelname):
+def validate(val_loader, model,criterion,epoch, temporal, dtype,modelname):
     # switch to evaluate mode
     model.eval()
     summary=Meter()
     video_losses = []
     print("Now running validation..")
     for i, video in enumerate(val_loader):
+        n=len(video)
+        start_idx = np.random.randint(0, n - 5)
         # accumulated_losses = []
         state = None  # Initially no hidden state
         prev_x = None  # Initially no hidden state
         prev_h = None
         prev_c = None
         with torch.no_grad():
-            for j, (clip, gtruths,gtruths_fix) in enumerate(video[0:10]):
+            for j, (clip, gtruths,gtruths_fix) in enumerate(video[start_idx:start_idx+5]):
 
                 clip = Variable(clip.type(dtype).transpose(0, 1), requires_grad=False).cuda()
                 gtruths = Variable(gtruths.type(dtype).transpose(0, 1), requires_grad=False).cuda()
@@ -740,6 +763,7 @@ def validate(val_loader, model,epoch, temporal, dtype,modelname):
                     # Compute loss
                     # nss = metric.CC(saliency_map.cpu().detach().numpy(), gtruths[idx].cpu().detach().numpy())
                     loss=loss_sequences(saliency_map, gtruths[idx],gtruths_fix[idx])
+                    mseloss=criterion(saliency_map,gtruths[idx])
 
                     saliency_map,sal,fix=saliency_map.cpu().detach().numpy(), gtruths[idx].cpu().detach().numpy(), gtruths_fix[idx].cpu().detach().numpy()
                     summary.update(saliency_map,sal,fix, (loss[0]-0.1*loss[1]-0.1*loss[2]).item())
