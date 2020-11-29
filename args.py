@@ -57,6 +57,8 @@ def get_training_parser():
     parser.add_argument('-dropout', dest='dropout', default=False, type=bool, help='Boolean value set to True if model includes dropout.')
     parser.add_argument('-residual', dest='residual', default=False, type=bool, help='Boolean value set to True if model includes residual connection on SalEMA')
     parser.add_argument('-double_ema', dest='double_ema', default=False, help="Set to False if you're not using two EMAs. If you want to use2 EMAs, use the number upon which you want the second ema to be located at")
+    parser.add_argument('-mema', dest='mema', default=False,type=bool,
+                        help='Input value for alpha. Set to None in order for the model to learn alpha (recommended).')
 
 
     return parser

@@ -128,7 +128,7 @@ class CCLSTM(CLSTM):
         out_gate = torch.sigmoid(out_gate)
 
         # apply tanh non linearity
-        cell_gate = torch.tanh(cell_gate)
+        # cell_gate = torch.tanh(cell_gate)
         # compute current cell and hidden state
 
         # print("forget gate size {}".format(forget_gate.size()))
@@ -138,7 +138,7 @@ class CCLSTM(CLSTM):
         forget = (forget_gate * prev_cell)
         update = (in_gate * cell_gate)
         cell = lamda*forget+(1-lamda)* update
-        hidden = out_gate * torch.tanh(cell)
+        hidden = out_gate * cell
 
         state = [hidden, cell]
         return hidden,cell,x
@@ -146,11 +146,14 @@ class CCLSTM(CLSTM):
 
 
 
+
+
 class salSEPCema(nn.Module):
     def __init__(self,alpha,backbone_name,pretrained=(
         'https://github.com/shinya7y/UniverseNet/releases/download/20.06/'
-        'res2net50_v1b_26w_4s-3cf99910_mmdetv2.pth')):
+        'res2net50_v1b_26w_4s-3cf99910_mmdetv2.pth'),mema=False):
         super(salSEPCema,self).__init__()
+        self.mema=mema
         backbone_cfg=dict(depth=50,deep_stem=True,avg_down=True,frozen_stages=1,dcn={'type':'DCN','deform_groups':1,'fallback_on_stride':False},
                           stage_with_dcn=(False, True, True, True))
         fpn_cfg=dict(in_channels=[256,512,1024,2048],out_channels=256,num_outs=5,start_level=0,add_extra_convs='on_output')
@@ -158,8 +161,8 @@ class salSEPCema(nn.Module):
         self.backbone=Res2Net(**backbone_cfg)
         self.fpn=FPN(**fpn_cfg)
         self.sepc=SEPC_Decoder(**sepc_cfg)
-        if alpha == None:
-            self.alpha = nn.Parameter(torch.Tensor([0.25]))
+        if alpha == None and self.mema:
+            self.alpha = nn.ParameterList([nn.Parameter(torch.tensor([0.25])) for _ in range(5)])
             print("Initial alpha set to: {}".format(self.alpha))
         else:
             self.alpha = torch.Tensor([float(alpha)]).cuda()
@@ -175,11 +178,20 @@ class salSEPCema(nn.Module):
         x=self.backbone(x)
         x=self.fpn(x)
         if prev_state is None:
-            current_state = x[2]
+            if self.mema:
+                current_state=x
+            else:
+                current_state = x[2]
         else:
-            current_state = self.alpha * x[2] + (1 - self.alpha) * prev_state
-        x=list(x)
-        x[2]=current_state
+            if self.mema:
+                current_state=tuple(torch.sigmoid(self.alpha[i]) * x[i] + (1 - torch.sigmoid(self.alpha[i])) * prev_state[i] for i in range(5))
+            else:
+                current_state = self.alpha * x[2] + (1 - self.alpha) * prev_state
+        if self.mema:
+            x=current_state
+        else:
+            x=list(x)
+            x[2]=current_state
         x=self.sepc(x)
         x=F.relu(self.gn1(self.semantic_branch(x[0]+x[1]+x[2]+x[3]+x[4])))
         x=self.output(x)
@@ -201,8 +213,9 @@ class salSEPCCCLSTM(nn.Module):
         self.backbone=Res2Net(**backbone_cfg)
         self.fpn=FPN(**fpn_cfg)
         self.sepc=SEPC_Decoder(**sepc_cfg)
-        self.CCLSTM=CCLSTM()
-        self.LSTMconv=nn.Conv2d(256, 256, kernel_size=3, stride=1, padding=1)
+        # self.CCLSTM = CCLSTM()
+        self.CCLSTM=nn.ModuleList([CCLSTM() for _ in range(5)])
+        # self.LSTMconv=nn.Conv2d(256, 256, kernel_size=3, stride=1, padding=1)
         self.semantic_branch = nn.Conv2d(256, 128, kernel_size=3, stride=1, padding=1)
         self.output=nn.Conv2d(128, 1, kernel_size=3, stride=1, padding=1)
         # self.decoder=Decoder()
@@ -211,12 +224,14 @@ class salSEPCCCLSTM(nn.Module):
         self.backbone.init_weights(pretrained=pretrained)
 
         # Freeze SalGAN
+        self.grad=[]
         if freeze:
             for name, child in self.named_children():
                 if name in 'CCLSTM' or name in 'LSTMconv':
                     continue
                 for param in child.parameters():
                     param.requires_grad = False
+                self.grad.append(name)
 
 
 
@@ -225,18 +240,39 @@ class salSEPCCCLSTM(nn.Module):
         x=self.backbone(x)
         x=self.fpn(x)
         if prev_h is None:
-            current_state=[self.CCLSTM(i) for i in x]
+            # current_state=self.CCLSTM(x[2])
+            current_state=[self.CCLSTM[i](x[i]) for i in range(5)]
         else:
-            current_state = [self.CCLSTM(xi,p,i,j) for xi,p,i,j in zip(x,prev_h,prev_c,prev_x)]
-        current_state=tuple(zip(*current_state))
-        x=current_state[0]
-        x=tuple(self.LSTMconv(i) for i in x)
+            # current_state = self.CCLSTM(x[2],prev_h,prev_c,prev_x)
+            current_state = [self.CCLSTM[i](x[i],prev_h[i],prev_c[i],prev_x[i]) for i in range(5)]
+        # x=tuple(self.LSTMconv(i) for i in x)
+        # x = list(x)
+        # x[2]=current_state[0]
+        current_state = tuple(zip(*current_state))
+        x = current_state[0]
         x=self.sepc(x)
         x=F.relu(self.gn1(self.semantic_branch(x[0]+x[1]+x[2]+x[3]+x[4])))
         x=self.output(x)
         # x=self.decoder(x)
         x = torch.sigmoid(x)
         return current_state,x
+
+    def unfreeze(self):
+        if len(self.grad)==0:
+            print('All of network have been unfreeze')
+            return
+        self.grad.pop()
+        for name, child in self.named_children():
+            # if name not in 'backbone':
+                    # a=list(list(self.sepc.children())[0].children())
+                    # for child in list(list(self.sepc.children())[0].children())[-5:]:
+                    #     for name, param in child.named_parameters():
+                    #         param.requires_grad = True
+            for name, param in child.named_parameters():
+                param.requires_grad = True
+
+
+
 
 
 
